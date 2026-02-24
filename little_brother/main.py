@@ -10,6 +10,7 @@ from .monitors.active_window import ActiveWindowMonitor
 from .monitors.mouse_clicks import MouseClickMonitor
 from .monitors.browser_tabs import BrowserTabMonitor
 from .monitors.filesystem import FileSystemMonitor
+from .dashboard.server import DashboardServer
 
 
 class LittleBrother:
@@ -19,6 +20,7 @@ class LittleBrother:
         """Initialize the Little Brother system."""
         self.db = None
         self.monitors = []
+        self.dashboard = None
         self.running = False
         self.shutdown_lock = threading.Lock()
 
@@ -56,6 +58,10 @@ class LittleBrother:
             monitor.start()
             print(f"[LB] - {monitor.__class__.__name__} started")
 
+        # Start dashboard
+        self.dashboard = DashboardServer(config)
+        self.dashboard.start()
+
         self.running = True
         print("[LB] Monitors started. Press Ctrl+C to stop.")
 
@@ -75,6 +81,13 @@ class LittleBrother:
                     monitor.stop()
                 except Exception as e:
                     print(f"[LB] Error stopping {monitor.__class__.__name__}: {e}")
+
+            # Stop dashboard
+            if self.dashboard:
+                try:
+                    self.dashboard.stop()
+                except Exception as e:
+                    print(f"[LB] Error stopping dashboard: {e}")
 
             # Stop database last
             if self.db:
