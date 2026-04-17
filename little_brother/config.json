@@ -6,5 +6,13 @@
     "C:/Users/%%USERNAME%%/Desktop",
     "D:/Documents/11Projects",
     "C:/Users/%%USERNAME%%/Downloads"
-  ]
+  ],
+  "api_key": "",
+  "webhooks": [],
+  "betty": {
+    "enabled": true,
+    "url": "http://localhost:8400",
+    "agent_id": "lb-desktop",
+    "secret_hex": "73c6b625ac012646e3f23ad505c340c116701502ab2f763a484d29ec3ca936bc"
+  }
 }

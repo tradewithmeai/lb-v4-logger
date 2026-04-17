@@ -1,0 +1,411 @@
+import json
+import os
+import queue
+import sqlite3
+import threading
+from datetime import datetime, timedelta
+
+from flask import Blueprint, Response, jsonify, request
+
+from .auth import require_api_key
+
+DB_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "little_brother.db")
+
+
+def get_db():
+    path = os.path.abspath(DB_PATH)
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def hours_ago(hours):
+    dt = datetime.utcnow() - timedelta(hours=hours)
+    return dt.isoformat()
+
+
+def create_api_blueprint(orchestrator, event_bus):
+    """Create the API Blueprint with references to the orchestrator and event bus."""
+
+    api = Blueprint("api_v1", __name__)
+
+    # ------------------------------------------------------------------
+    # Status
+    # ------------------------------------------------------------------
+
+    @api.route("/api/v1/status")
+    def api_status():
+        monitors = {}
+        for name, mon in orchestrator.monitor_map.items():
+            monitors[name] = {
+                "running": mon.is_running,
+                "class": mon.__class__.__name__,
+            }
+
+        db_path = os.path.abspath(DB_PATH)
+        db_size = round(os.path.getsize(db_path) / 1024, 1) if os.path.exists(db_path) else 0
+
+        return jsonify({
+            "running": orchestrator.running,
+            "uptime_seconds": orchestrator.uptime_seconds,
+            "monitors": monitors,
+            "database": {
+                "path": db_path,
+                "size_kb": db_size,
+                "queue_depth": orchestrator.db.event_queue.qsize() if orchestrator.db else 0,
+            },
+            "dashboard_port": orchestrator.config.get("dashboard_port", 5000),
+        })
+
+    # ------------------------------------------------------------------
+    # Unified event query
+    # ------------------------------------------------------------------
+
+    @api.route("/api/v1/events")
+    def api_events():
+        hours = float(request.args.get("hours", 24))
+        limit = int(request.args.get("limit", 100))
+        offset = int(request.args.get("offset", 0))
+        search = request.args.get("search", "").strip()
+        event_types = request.args.get("type", "").strip()
+
+        since = hours_ago(hours)
+        conn = get_db()
+        try:
+            results = []
+
+            table_map = {
+                "active_window": (
+                    "active_window_events",
+                    "timestamp, 'active_window' as event_type, window_title, process_name, '' as url, '' as src_path, '' as button",
+                    "window_title LIKE ? OR process_name LIKE ?",
+                ),
+                "mouse_click": (
+                    "mouse_click_events",
+                    "timestamp, 'mouse_click' as event_type, window_title, '' as process_name, '' as url, '' as src_path, button",
+                    "window_title LIKE ?",
+                ),
+                "browser_tab": (
+                    "browser_tab_events",
+                    "timestamp, 'browser_tab' as event_type, title as window_title, '' as process_name, url, '' as src_path, '' as button",
+                    "title LIKE ? OR url LIKE ?",
+                ),
+                "file_event": (
+                    "file_events",
+                    "timestamp, 'file_event' as event_type, '' as window_title, '' as process_name, '' as url, src_path, '' as button",
+                    "src_path LIKE ?",
+                ),
+            }
+
+            if event_types:
+                selected = [t.strip() for t in event_types.split(",")]
+            else:
+                selected = list(table_map.keys())
+
+            unions = []
+            params = []
+            for etype in selected:
+                if etype not in table_map:
+                    continue
+                table, cols, search_clause = table_map[etype]
+                if search:
+                    pattern = f"%{search}%"
+                    clause_params = [pattern] * search_clause.count("?")
+                    unions.append(
+                        f"SELECT {cols} FROM {table} WHERE timestamp >= ? AND ({search_clause})"
+                    )
+                    params.append(since)
+                    params.extend(clause_params)
+                else:
+                    unions.append(f"SELECT {cols} FROM {table} WHERE timestamp >= ?")
+                    params.append(since)
+
+            if not unions:
+                return jsonify({"events": [], "total": 0})
+
+            sql = " UNION ALL ".join(unions) + f" ORDER BY timestamp DESC LIMIT {limit} OFFSET {offset}"
+            rows = conn.execute(sql, params).fetchall()
+            events = [dict(r) for r in rows]
+
+            return jsonify({"events": events, "count": len(events)})
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Context at timestamp (for NSM and AI correlation)
+    # ------------------------------------------------------------------
+
+    @api.route("/api/v1/context")
+    def api_context():
+        ts_param = request.args.get("ts", "").strip()
+        window = int(request.args.get("window", 3))
+
+        if ts_param:
+            try:
+                ts_dt = datetime.fromisoformat(ts_param.replace("Z", "+00:00"))
+                ts_dt = ts_dt.replace(tzinfo=None)  # normalise to naive UTC (matches DB)
+            except ValueError:
+                return jsonify({"error": "invalid ts — use ISO format"}), 400
+        else:
+            ts_dt = datetime.utcnow()
+
+        ts_str = ts_dt.isoformat()
+        lo = (ts_dt - timedelta(minutes=window)).isoformat()
+        hi = (ts_dt + timedelta(minutes=window)).isoformat()
+
+        conn = get_db()
+        try:
+            # --- active window ---
+            rows = conn.execute(
+                "SELECT process_name, window_title, timestamp FROM active_window_events"
+                " WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp DESC",
+                (lo, hi),
+            ).fetchall()
+
+            if rows:
+                aw_source = "window"
+                aw_processes = list(dict.fromkeys(r["process_name"] for r in rows if r["process_name"]))
+                aw_title = rows[0]["window_title"]
+                aw_last = rows[0]["timestamp"]
+            else:
+                # fall back to last known state before the alert
+                row = conn.execute(
+                    "SELECT process_name, window_title, timestamp FROM active_window_events"
+                    " WHERE timestamp <= ? ORDER BY timestamp DESC LIMIT 1",
+                    (hi,),
+                ).fetchone()
+                aw_source = "last_known"
+                aw_processes = [row["process_name"]] if row and row["process_name"] else []
+                aw_title = row["window_title"] if row else None
+                aw_last = row["timestamp"] if row else None
+
+            if aw_last:
+                aw_last_dt = datetime.fromisoformat(aw_last)
+                aw_seconds_ago = int((ts_dt - aw_last_dt).total_seconds())
+            else:
+                aw_seconds_ago = None
+
+            # --- browser tabs ---
+            tab_rows = conn.execute(
+                "SELECT url, title, timestamp FROM browser_tab_events"
+                " WHERE timestamp >= ? AND timestamp <= ? AND url IS NOT NULL ORDER BY timestamp DESC",
+                (lo, hi),
+            ).fetchall()
+
+            if tab_rows:
+                bt_source = "window"
+                bt_domains = list(dict.fromkeys(
+                    _domain(r["url"]) for r in tab_rows if _domain(r["url"])
+                ))
+                bt_last = tab_rows[0]["timestamp"]
+            else:
+                tab_row = conn.execute(
+                    "SELECT url, title, timestamp FROM browser_tab_events"
+                    " WHERE timestamp <= ? AND url IS NOT NULL ORDER BY timestamp DESC LIMIT 1",
+                    (hi,),
+                ).fetchone()
+                bt_source = "last_known"
+                bt_domains = [_domain(tab_row["url"])] if tab_row and _domain(tab_row["url"]) else []
+                bt_last = tab_row["timestamp"] if tab_row else None
+
+            if bt_last:
+                bt_last_dt = datetime.fromisoformat(bt_last)
+                bt_seconds_ago = int((ts_dt - bt_last_dt).total_seconds())
+            else:
+                bt_seconds_ago = None
+
+            result = {
+                "ts_requested": ts_str,
+                "window_minutes": window,
+                "active_window": {
+                    "source": aw_source,
+                    "processes": aw_processes,
+                    "window_title": aw_title,
+                    "last_seen": aw_last,
+                    "seconds_ago": aw_seconds_ago,
+                },
+                "browser_tabs": {
+                    "source": bt_source,
+                    "domains": bt_domains,
+                    "last_seen": bt_last,
+                    "seconds_ago": bt_seconds_ago,
+                },
+            }
+            return jsonify(result)
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # SSE event stream
+    # ------------------------------------------------------------------
+
+    @api.route("/api/v1/events/stream")
+    def api_event_stream():
+        def generate():
+            q = queue.Queue()
+
+            def on_event(event):
+                q.put(event)
+
+            event_bus.subscribe(on_event)
+            try:
+                while True:
+                    try:
+                        event = q.get(timeout=30)
+                        yield f"data: {json.dumps(event.to_dict())}\n\n"
+                    except queue.Empty:
+                        yield ": keepalive\n\n"
+            except GeneratorExit:
+                pass
+            finally:
+                event_bus.unsubscribe(on_event)
+
+        return Response(
+            generate(),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # ------------------------------------------------------------------
+    # Monitor control
+    # ------------------------------------------------------------------
+
+    @api.route("/api/v1/monitors/<name>/start", methods=["POST"])
+    @require_api_key
+    def start_monitor(name):
+        monitor = orchestrator.monitor_map.get(name)
+        if not monitor:
+            return jsonify({"error": f"Unknown monitor: {name}"}), 404
+        if monitor.is_running:
+            return jsonify({"status": "already_running", "monitor": name})
+        monitor.start()
+        return jsonify({"status": "started", "monitor": name})
+
+    @api.route("/api/v1/monitors/<name>/stop", methods=["POST"])
+    @require_api_key
+    def stop_monitor(name):
+        monitor = orchestrator.monitor_map.get(name)
+        if not monitor:
+            return jsonify({"error": f"Unknown monitor: {name}"}), 404
+        if not monitor.is_running:
+            return jsonify({"status": "already_stopped", "monitor": name})
+        monitor.stop()
+        return jsonify({"status": "stopped", "monitor": name})
+
+    @api.route("/api/v1/monitors/start-all", methods=["POST"])
+    @require_api_key
+    def start_all_monitors():
+        results = {}
+        for name, mon in orchestrator.monitor_map.items():
+            if not mon.is_running:
+                mon.start()
+                results[name] = "started"
+            else:
+                results[name] = "already_running"
+        return jsonify({"status": "ok", "monitors": results})
+
+    @api.route("/api/v1/monitors/stop-all", methods=["POST"])
+    @require_api_key
+    def stop_all_monitors():
+        results = {}
+        for name, mon in orchestrator.monitor_map.items():
+            if mon.is_running:
+                mon.stop()
+                results[name] = "stopped"
+            else:
+                results[name] = "already_stopped"
+        return jsonify({"status": "ok", "monitors": results})
+
+    # ------------------------------------------------------------------
+    # Configuration
+    # ------------------------------------------------------------------
+
+    @api.route("/api/v1/config", methods=["GET"])
+    @require_api_key
+    def get_config():
+        return jsonify(orchestrator.config)
+
+    @api.route("/api/v1/config", methods=["PATCH"])
+    @require_api_key
+    def update_config():
+        updates = request.get_json(silent=True) or {}
+        if not updates:
+            return jsonify({"error": "No JSON body provided"}), 400
+
+        new_config = orchestrator.update_config(updates)
+        restart_needed = []
+        if "active_window_poll_ms" in updates:
+            restart_needed.append("active_window")
+        if "browser_debug_port" in updates:
+            restart_needed.append("browser_tabs")
+        if "folders_to_watch" in updates:
+            restart_needed.append("filesystem")
+
+        return jsonify({"config": new_config, "restart_required": restart_needed})
+
+    # ------------------------------------------------------------------
+    # Webhooks
+    # ------------------------------------------------------------------
+
+    @api.route("/api/v1/webhooks", methods=["GET"])
+    @require_api_key
+    def list_webhooks():
+        hooks = orchestrator.config.get("webhooks", [])
+        return jsonify({"webhooks": [{"id": i, "url": url} for i, url in enumerate(hooks)]})
+
+    @api.route("/api/v1/webhooks", methods=["POST"])
+    @require_api_key
+    def add_webhook():
+        data = request.get_json(silent=True) or {}
+        url = data.get("url", "").strip()
+        if not url:
+            return jsonify({"error": "url is required"}), 400
+
+        webhooks = orchestrator.config.get("webhooks", [])
+        if url in webhooks:
+            return jsonify({"error": "Webhook already registered"}), 409
+        webhooks.append(url)
+        orchestrator.update_config({"webhooks": webhooks})
+
+        # Subscribe to event bus for this webhook
+        _register_webhook(url, event_bus)
+
+        return jsonify({"status": "registered", "url": url}), 201
+
+    @api.route("/api/v1/webhooks/<int:hook_id>", methods=["DELETE"])
+    @require_api_key
+    def delete_webhook(hook_id):
+        webhooks = orchestrator.config.get("webhooks", [])
+        if hook_id < 0 or hook_id >= len(webhooks):
+            return jsonify({"error": "Webhook not found"}), 404
+        removed = webhooks.pop(hook_id)
+        orchestrator.update_config({"webhooks": webhooks})
+        return jsonify({"status": "removed", "url": removed})
+
+    return api
+
+
+def _domain(url: str) -> str | None:
+    """Extract hostname from a URL, stripping www. prefix."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        return host.removeprefix("www.") or None
+    except Exception:
+        return None
+
+
+def _register_webhook(url, event_bus):
+    """Register a webhook URL as an EventBus subscriber."""
+    import requests as req_lib
+
+    def send_webhook(event):
+        def _post():
+            try:
+                req_lib.post(url, json=event.to_dict(), timeout=5)
+            except Exception:
+                pass
+
+        threading.Thread(target=_post, daemon=True).start()
+
+    event_bus.subscribe(send_webhook)
