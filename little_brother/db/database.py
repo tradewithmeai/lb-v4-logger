@@ -17,14 +17,18 @@ def load_config():
 class Database:
     """Thread-safe database manager for Little Brother events."""
 
-    def __init__(self, db_path="little_brother.db"):
+    def __init__(self, db_path="little_brother.db", event_bus=None):
         """Initialize database connection and start writer thread.
 
         Args:
             db_path: Path to SQLite database file
+            event_bus: Optional EventBus instance for real-time event publishing
         """
         self.db_path = db_path
+        self.event_bus = event_bus
         self.event_queue = queue.Queue()
+        self._dropped_events = 0
+        self._queue_cap = 500
         self.running = True
 
         # Create database connection
@@ -55,7 +59,22 @@ class Database:
             table: Table name (e.g., 'active_window_events')
             data_dict: Dictionary of column names to values
         """
+        if self.event_queue.qsize() >= self._queue_cap:
+            self._dropped_events += 1
+            if self._dropped_events % 100 == 1:
+                print(f"[DB] Queue full ({self._queue_cap}), dropping events (total dropped: {self._dropped_events})")
+            return
         self.event_queue.put((table, data_dict))
+
+        if self.event_bus:
+            from ..events import Event, TABLE_TO_EVENT_TYPE
+            evt = Event(
+                event_type=TABLE_TO_EVENT_TYPE.get(table, table),
+                table=table,
+                data=dict(data_dict),
+                timestamp=data_dict.get("timestamp", ""),
+            )
+            self.event_bus.publish(evt)
 
     def start_writer_thread(self):
         """Start the background writer thread."""
@@ -98,16 +117,19 @@ class Database:
         print("Stopping database writer...")
         self.running = False
 
-        # Wait for queue to be empty
-        self.event_queue.join()
-
-        # Wait for writer thread to finish
-        if self.writer_thread.is_alive():
+        # Drain up to 2 seconds worth of queued events, then give up.
+        # Losing queued events on shutdown is acceptable for a monitoring app.
+        try:
             self.writer_thread.join(timeout=2.0)
+        except Exception:
+            pass
 
-        # Close database connection
         self.conn.close()
-        print("Database stopped cleanly")
+        remaining = self.event_queue.qsize()
+        if remaining:
+            print(f"Database stopped (discarded {remaining} queued events)")
+        else:
+            print("Database stopped cleanly")
 
     # Insert wrapper methods
 

@@ -1,5 +1,19 @@
 import os
 import datetime
+from pathlib import Path
+
+# File extensions that are never worth recording
+_EXCLUDED_EXTENSIONS = {
+    ".db", ".db-journal", ".db-wal", ".db-shm",
+    ".log", ".tmp", ".temp", ".bak",
+    ".pyc", ".pyo",
+}
+
+# Directory names that are never worth recording
+_EXCLUDED_DIR_NAMES = {
+    "__pycache__", ".git", "node_modules", ".pytest_cache",
+    "venv", ".venv", "env",
+}
 
 
 class FileSystemMonitor:
@@ -10,6 +24,14 @@ class FileSystemMonitor:
         self.config = config
         self._observer = None
         self._watch_paths = self._resolve_paths(config.get("folders_to_watch", []))
+        # Always exclude the app's own directory to prevent feedback loops
+        self._excluded_paths = {
+            str(Path(__file__).resolve().parent.parent.parent)  # project root
+        }
+
+    @property
+    def is_running(self):
+        return self._observer is not None and self._observer.is_alive()
 
     def start(self):
         try:
@@ -80,7 +102,27 @@ class FileSystemMonitor:
 
         return Handler()
 
+    def _should_ignore(self, path: str) -> bool:
+        p = Path(path)
+        # Ignore excluded extensions
+        if p.suffix.lower() in _EXCLUDED_EXTENSIONS:
+            return True
+        # Ignore excluded directory names anywhere in the path
+        if any(part in _EXCLUDED_DIR_NAMES for part in p.parts):
+            return True
+        # Ignore anything inside the app's own directory tree
+        try:
+            resolved = str(p.resolve())
+            for excl in self._excluded_paths:
+                if resolved.startswith(excl):
+                    return True
+        except Exception:
+            pass
+        return False
+
     def _log(self, event, event_type):
+        if self._should_ignore(event.src_path):
+            return
         try:
             timestamp = datetime.datetime.utcnow().isoformat()
             self.db.log_file_event(
