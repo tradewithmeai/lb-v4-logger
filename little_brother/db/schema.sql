@@ -32,3 +32,13 @@ CREATE TABLE IF NOT EXISTS file_events (
     src_path TEXT,
     is_directory INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS key_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    window_title TEXT,
+    process_name TEXT,
+    text_chunk TEXT,
+    key_count INTEGER,
+    suppressed INTEGER DEFAULT 0
+);

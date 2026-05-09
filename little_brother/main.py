@@ -10,9 +10,9 @@ from .monitors.active_window import ActiveWindowMonitor
 from .monitors.mouse_clicks import MouseClickMonitor
 from .monitors.browser_tabs import BrowserTabMonitor
 from .monitors.filesystem import FileSystemMonitor
+from .monitors.keyboard import KeyboardMonitor
 from .events import EventBus
 from .dashboard.server import DashboardServer
-from .betty import BettySentinel
 
 
 class LittleBrother:
@@ -29,7 +29,6 @@ class LittleBrother:
         self.running = False
         self._start_time = None
         self.shutdown_lock = threading.Lock()
-        self.betty = BettySentinel()
 
     def load_config(self):
         """Load configuration from config.json."""
@@ -59,14 +58,16 @@ class LittleBrother:
         mouse_mon = MouseClickMonitor(self.db)
         browser_mon = BrowserTabMonitor(self.db, config)
         fs_mon = FileSystemMonitor(self.db, config)
+        keyboard_mon = KeyboardMonitor(self.db)
 
         # Store monitors in startup order for later shutdown
-        self.monitors = [active_win_mon, mouse_mon, browser_mon, fs_mon]
+        self.monitors = [active_win_mon, mouse_mon, browser_mon, fs_mon, keyboard_mon]
         self.monitor_map = {
             "active_window": active_win_mon,
             "mouse_clicks": mouse_mon,
             "browser_tabs": browser_mon,
             "filesystem": fs_mon,
+            "keyboard": keyboard_mon,
         }
 
         # Start all monitors
@@ -85,9 +86,6 @@ class LittleBrother:
         self._start_time = time.time()
         self.running = True
 
-        # Start Betty Sentinel telemetry
-        self.betty.start(self)
-
         print("[LB] Monitors started. Press Ctrl+C to stop.")
 
     def stop(self):
@@ -98,9 +96,6 @@ class LittleBrother:
 
             print("\n[LB] Shutting down...")
             self.running = False
-
-            # Stop Betty Sentinel before monitors
-            self.betty.stop()
 
             # Stop monitors in reverse order
             for monitor in reversed(self.monitors):

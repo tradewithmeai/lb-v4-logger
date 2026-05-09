@@ -203,6 +203,16 @@ class Database:
             "is_directory": is_directory
         })
 
+    def log_key_event(self, timestamp, window_title, process_name, text_chunk, key_count, suppressed=0):
+        self.write_event("key_events", {
+            "timestamp": timestamp,
+            "window_title": window_title,
+            "process_name": process_name,
+            "text_chunk": text_chunk,
+            "key_count": key_count,
+            "suppressed": suppressed,
+        })
+
 
 if __name__ == "__main__":
     print("Testing database module...")
